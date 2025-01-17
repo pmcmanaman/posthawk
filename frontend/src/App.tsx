@@ -1,10 +1,10 @@
 import { AuthProvider } from './context/AuthContext'
-import { Layout } from './components/Layout'
+import { EmailTest } from './components/EmailTest'
 
 function App() {
   return (
     <AuthProvider>
-      <Layout />
+      <EmailTest />
     </AuthProvider>
   )
 }

@@ -1,5 +1,5 @@
 import express from 'express'
-import { createUser, findUserByEmail } from '../controllers/userController'
+import { createUser, findUserByEmail, checkEmail } from '../controllers/userController'
 import { createApiKey, listApiKeys, deactivateApiKey } from '../controllers/apiKeyController'
 import { createTest, listTests, getTestById, updateTest } from '../controllers/testController'
 import { authenticateUser } from '../middleware/auth'
@@ -87,4 +87,4 @@ router.put('/tests/:id', authenticateUser, async (req, res) => {
   }
 })
 
-export default router 
+export default router
