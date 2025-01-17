@@ -155,23 +155,28 @@ func validateEmail(email string, config config.Config, clientID string) validati
 		IsFreeProvider: false,
 	}
 
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 {
+		metrics.ValidationRequests.WithLabelValues("invalid_format", "format", clientID, "").Inc()
+		response.Details = "Invalid email format"
+		return response
+	}
+	domain := parts[1]
+
 	// Format check
 	formatCheck := validation.PerformFormatCheck(email)
 	response.Checks = append(response.Checks, formatCheck)
 	if !formatCheck.Passed {
-		metrics.ValidationRequests.WithLabelValues("invalid_format", "format", clientID).Inc()
+		metrics.ValidationRequests.WithLabelValues("invalid_format", "format", clientID, domain).Inc()
 		response.Details = formatCheck.Details
 		return response
 	}
-
-	parts := strings.Split(email, "@")
-	domain := parts[1]
 
 	// Length checks
 	lengthCheck := validation.PerformLengthCheck(parts[0], domain)
 	response.Checks = append(response.Checks, lengthCheck)
 	if !lengthCheck.Passed {
-		metrics.ValidationRequests.WithLabelValues("invalid_length", "length", clientID).Inc()
+		metrics.ValidationRequests.WithLabelValues("invalid_length", "length", clientID, domain).Inc()
 		response.Details = lengthCheck.Details
 		return response
 	}
@@ -182,7 +187,7 @@ func validateEmail(email string, config config.Config, clientID string) validati
 		response.Checks = append(response.Checks, disposableCheck)
 		response.IsDisposable = !disposableCheck.Passed
 		if response.IsDisposable {
-			metrics.ValidationRequests.WithLabelValues("disposable", "disposable", clientID).Inc()
+			metrics.ValidationRequests.WithLabelValues("disposable", "disposable", clientID, domain).Inc()
 			response.Details = "Disposable email address detected"
 			response.RecommendedAction = "Request a different email address"
 			return response
@@ -193,7 +198,7 @@ func validateEmail(email string, config config.Config, clientID string) validati
 	mxCheck := validation.PerformMXCheck(domain)
 	response.Checks = append(response.Checks, mxCheck)
 	if !mxCheck.Passed {
-		metrics.ValidationRequests.WithLabelValues("mx_failed", "mx", clientID).Inc()
+		metrics.ValidationRequests.WithLabelValues("mx_failed", "mx", clientID, domain).Inc()
 		response.Details = mxCheck.Details
 		return response
 	}
@@ -202,7 +207,7 @@ func validateEmail(email string, config config.Config, clientID string) validati
 	smtpCheck := validation.PerformSMTPCheck(email, domain, config.SMTPTimeout, logger)
 	response.Checks = append(response.Checks, smtpCheck)
 	if !smtpCheck.Passed {
-		metrics.ValidationRequests.WithLabelValues("smtp_failed", "smtp", clientID).Inc()
+		metrics.ValidationRequests.WithLabelValues("smtp_failed", "smtp", clientID, domain).Inc()
 		response.Details = smtpCheck.Details
 		return response
 	}
@@ -211,7 +216,7 @@ func validateEmail(email string, config config.Config, clientID string) validati
 	dnsCheck := validation.PerformDNSCheck(domain)
 	response.Checks = append(response.Checks, dnsCheck)
 	if !dnsCheck.Passed {
-		metrics.ValidationRequests.WithLabelValues("dns_failed", "dns", clientID).Inc()
+		metrics.ValidationRequests.WithLabelValues("dns_failed", "dns", clientID, domain).Inc()
 		response.Details = dnsCheck.Details
 		return response
 	}
@@ -220,7 +225,7 @@ func validateEmail(email string, config config.Config, clientID string) validati
 	tldCheck := validation.PerformTLDCheck(domain)
 	response.Checks = append(response.Checks, tldCheck)
 	if !tldCheck.Passed {
-		metrics.ValidationRequests.WithLabelValues("tld_failed", "tld", clientID).Inc()
+		metrics.ValidationRequests.WithLabelValues("tld_failed", "tld", clientID, domain).Inc()
 		response.Details = tldCheck.Details
 		return response
 	}
@@ -238,8 +243,8 @@ func validateEmail(email string, config config.Config, clientID string) validati
 	response.IsValid = true
 	response.Details = "Email address is valid"
 	response.ValidationTime = time.Since(startTime).Seconds()
-	metrics.ValidationRequests.WithLabelValues("success", "all", clientID).Inc()
-	metrics.ValidationDuration.WithLabelValues("complete").Observe(response.ValidationTime)
+	metrics.ValidationRequests.WithLabelValues("success", "all", clientID, domain).Inc()
+	metrics.ValidationDuration.WithLabelValues("complete", domain).Observe(response.ValidationTime)
 
 	return response
 }
@@ -514,25 +519,25 @@ func main() {
 	v1 := http.NewServeMux()
 
 	// Main validation endpoint
-	v1.HandleFunc("/validate", func(w http.ResponseWriter, r *http.Request) {
+	v1.HandleFunc("/v1/validate", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-API-Version", "v1")
 		emailHandler(w, r, cfg)
 	})
 
 	// Batch validation endpoint
-	v1.HandleFunc("/validate/batch", func(w http.ResponseWriter, r *http.Request) {
+	v1.HandleFunc("/v1/validate/batch", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-API-Version", "v1")
 		batchEmailHandler(w, r, cfg)
 	})
 
 	// Domain reputation endpoint
-	v1.HandleFunc("/domain/reputation", func(w http.ResponseWriter, r *http.Request) {
+	v1.HandleFunc("/v1/domain/reputation", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-API-Version", "v1")
 		domainReputationHandler(w, r, cfg)
 	})
 
 	// Mount versioned API
-	mux.Handle("/v1/", http.StripPrefix("/v1", v1))
+	mux.Handle("/v1/", v1)
 
 	// Prometheus metrics endpoint
 	mux.Handle("/metrics", promhttp.Handler())

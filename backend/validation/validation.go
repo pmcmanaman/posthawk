@@ -1,8 +1,10 @@
 package validation
 
 import (
+	"fmt"
 	"net"
-	"net/smtp"
+	"net/textproto"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -32,8 +34,8 @@ type ValidationResponse struct {
 
 // Format validation
 func PerformFormatCheck(email string) Check {
-	// Basic email format regex
-	emailRegex := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
+	// More comprehensive email format regex based on RFC 5322
+	emailRegex := `^[a-zA-Z0-9.!#$%&'*+/=?^_{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$`
 	matched, _ := regexp.MatchString(emailRegex, email)
 
 	return Check{
@@ -58,12 +60,41 @@ func PerformLengthCheck(localPart, domain string) Check {
 
 // Disposable email check
 func CheckDisposableEmail(domain string, logger *logrus.Logger) Check {
-	// This would check against a list of known disposable domains
-	// For now, just return true (passed) as a placeholder
+	// Load disposable domains from file
+	data, err := os.ReadFile("backend/disposable_domains.txt")
+	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"error": err.Error(),
+		}).Warn("Failed to load disposable domains")
+		return Check{
+			Name:    "disposable",
+			Passed:  true,
+			Details: "Failed to load disposable domains list",
+		}
+	}
+
+	// Convert to map for quick lookup
+	disposableDomains := make(map[string]bool)
+	for _, d := range strings.Split(string(data), "\n") {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			disposableDomains[d] = true
+		}
+	}
+
+	// Check if domain is disposable
+	if disposableDomains[domain] {
+		return Check{
+			Name:    "disposable",
+			Passed:  false,
+			Details: "Disposable email domain detected",
+		}
+	}
+
 	return Check{
 		Name:    "disposable",
 		Passed:  true,
-		Details: "Disposable email check",
+		Details: "No disposable email domain detected",
 	}
 }
 
@@ -89,22 +120,138 @@ func PerformSMTPCheck(email, domain string, timeout time.Duration, logger *logru
 		}
 	}
 
-	// Try connecting to first MX server
+	// Try connecting to first MX server with timeout
 	addr := mxRecords[0].Host + ":25"
-	client, err := smtp.Dial(addr)
+	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"error": err.Error(),
+			"mx":    mxRecords[0].Host,
+		}).Debug("SMTP connection failed")
 		return Check{
 			Name:    "smtp",
 			Passed:  false,
 			Details: "Failed to connect to mail server",
 		}
 	}
-	defer client.Close()
+	defer conn.Close()
+
+	// Create textproto connection
+	tc := textproto.NewConn(conn)
+	defer tc.Close()
+
+	// Create SMTP log buffer
+	var smtpLog strings.Builder
+	logResponse := func(code int, message string) {
+		smtpLog.WriteString(fmt.Sprintf("%d %s\n", code, message))
+	}
+
+	// Read server greeting
+	code, message, err := tc.ReadResponse(220)
+	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"error": err.Error(),
+			"log":   smtpLog.String(),
+		}).Debug("SMTP greeting failed")
+		return Check{
+			Name:    "smtp",
+			Passed:  false,
+			Details: "SMTP validation failed - greeting",
+		}
+	}
+	logResponse(code, message)
+
+	// Send EHLO
+	err = tc.PrintfLine("EHLO posthawk.com")
+	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"error": err.Error(),
+			"log":   smtpLog.String(),
+		}).Debug("SMTP EHLO failed")
+		return Check{
+			Name:    "smtp",
+			Passed:  false,
+			Details: "SMTP validation failed - EHLO",
+		}
+	}
+	code, message, err = tc.ReadResponse(250)
+	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"error": err.Error(),
+			"log":   smtpLog.String(),
+		}).Debug("SMTP EHLO response failed")
+		return Check{
+			Name:    "smtp",
+			Passed:  false,
+			Details: "SMTP EHLO response failed",
+		}
+	}
+	logResponse(code, message)
+
+	// Send MAIL FROM
+	err = tc.PrintfLine("MAIL FROM:<verify@posthawk.com>")
+	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"error": err.Error(),
+			"log":   smtpLog.String(),
+		}).Debug("SMTP MAIL FROM failed")
+		return Check{
+			Name:    "smtp",
+			Passed:  false,
+			Details: "SMTP MAIL FROM failed",
+		}
+	}
+	code, message, err = tc.ReadResponse(250)
+	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"error": err.Error(),
+			"log":   smtpLog.String(),
+		}).Debug("SMTP MAIL FROM response failed")
+		return Check{
+			Name:    "smtp",
+			Passed:  false,
+			Details: "SMTP validation failed - MAIL FROM response",
+		}
+	}
+	logResponse(code, message)
+
+	// Send RCPT TO
+	err = tc.PrintfLine("RCPT TO:<%s>", email)
+	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"error": err.Error(),
+			"log":   smtpLog.String(),
+		}).Debug("SMTP RCPT TO failed")
+		return Check{
+			Name:    "smtp",
+			Passed:  false,
+			Details: "SMTP validation failed - RCPT TO",
+		}
+	}
+	code, message, err = tc.ReadResponse(250)
+	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"error": err.Error(),
+			"log":   smtpLog.String(),
+		}).Debug("SMTP RCPT TO response failed")
+		return Check{
+			Name:    "smtp",
+			Passed:  false,
+			Details: "SMTP validation failed - RCPT TO response",
+		}
+	}
+	logResponse(code, message)
+
+	// Log full SMTP conversation
+	logger.WithFields(logrus.Fields{
+		"email": email,
+		"log":   smtpLog.String(),
+	}).Debug("SMTP validation completed")
 
 	return Check{
 		Name:    "smtp",
 		Passed:  true,
-		Details: "SMTP server validation",
+		Details: "SMTP validation successful",
 	}
 }
 
