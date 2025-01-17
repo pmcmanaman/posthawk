@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/smtp"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +25,7 @@ import (
 
 	"posthawk/backend/config"
 	"posthawk/backend/metrics"
+	"posthawk/backend/validation"
 )
 
 const (
@@ -51,26 +51,6 @@ type ClientConfig struct {
 
 type EmailRequest struct {
 	Email string `json:"email"`
-}
-
-type ValidationResponse struct {
-	Email             string  `json:"email"`
-	IsValid           bool    `json:"is_valid"`
-	Details           string  `json:"details"`
-	IsDisposable      bool    `json:"is_disposable,omitempty"`
-	IsRoleAccount     bool    `json:"is_role_account,omitempty"`
-	IsFreeProvider    bool    `json:"is_free_provider,omitempty"`
-	ValidationTime    float64 `json:"validation_time"`
-	Checks            []Check `json:"checks"`
-	RecommendedAction string  `json:"recommended_action,omitempty"`
-	Version           string  `json:"version"`
-	ServiceName       string  `json:"service_name"`
-}
-
-type Check struct {
-	Name    string `json:"name"`
-	Passed  bool   `json:"passed"`
-	Details string `json:"details,omitempty"`
 }
 
 func init() {
@@ -160,15 +140,15 @@ func (w *wrappedWriter) Write(b []byte) (int, error) {
 	return size, err
 }
 
-func validateEmail(email string, config config.Config, clientID string) ValidationResponse {
+func validateEmail(email string, config config.Config, clientID string) validation.ValidationResponse {
 	startTime := time.Now()
 	metrics.ActiveRequests.Inc()
 	defer metrics.ActiveRequests.Dec()
 
-	response := ValidationResponse{
+	response := validation.ValidationResponse{
 		Email:          email,
 		IsValid:        false,
-		Checks:         make([]Check, 0),
+		Checks:         make([]validation.Check, 0),
 		Version:        VERSION,
 		ServiceName:    APP_NAME,
 		IsRoleAccount:  false,
@@ -176,7 +156,7 @@ func validateEmail(email string, config config.Config, clientID string) Validati
 	}
 
 	// Format check
-	formatCheck := performFormatCheck(email)
+	formatCheck := validation.PerformFormatCheck(email)
 	response.Checks = append(response.Checks, formatCheck)
 	if !formatCheck.Passed {
 		metrics.ValidationRequests.WithLabelValues("invalid_format", "format", clientID).Inc()
@@ -188,7 +168,7 @@ func validateEmail(email string, config config.Config, clientID string) Validati
 	domain := parts[1]
 
 	// Length checks
-	lengthCheck := performLengthCheck(parts[0], domain)
+	lengthCheck := validation.PerformLengthCheck(parts[0], domain)
 	response.Checks = append(response.Checks, lengthCheck)
 	if !lengthCheck.Passed {
 		metrics.ValidationRequests.WithLabelValues("invalid_length", "length", clientID).Inc()
@@ -198,7 +178,7 @@ func validateEmail(email string, config config.Config, clientID string) Validati
 
 	// Disposable email check
 	if config.DisposableCheck {
-		disposableCheck := checkDisposableEmail(domain)
+		disposableCheck := validation.CheckDisposableEmail(domain, logger)
 		response.Checks = append(response.Checks, disposableCheck)
 		response.IsDisposable = !disposableCheck.Passed
 		if response.IsDisposable {
@@ -210,7 +190,7 @@ func validateEmail(email string, config config.Config, clientID string) Validati
 	}
 
 	// MX record check
-	mxCheck := performMXCheck(domain)
+	mxCheck := validation.PerformMXCheck(domain)
 	response.Checks = append(response.Checks, mxCheck)
 	if !mxCheck.Passed {
 		metrics.ValidationRequests.WithLabelValues("mx_failed", "mx", clientID).Inc()
@@ -219,7 +199,7 @@ func validateEmail(email string, config config.Config, clientID string) Validati
 	}
 
 	// SMTP check
-	smtpCheck := performSMTPCheck(email, domain, config.SMTPTimeout)
+	smtpCheck := validation.PerformSMTPCheck(email, domain, config.SMTPTimeout, logger)
 	response.Checks = append(response.Checks, smtpCheck)
 	if !smtpCheck.Passed {
 		metrics.ValidationRequests.WithLabelValues("smtp_failed", "smtp", clientID).Inc()
@@ -228,7 +208,7 @@ func validateEmail(email string, config config.Config, clientID string) Validati
 	}
 
 	// DNS record check
-	dnsCheck := performDNSCheck(domain)
+	dnsCheck := validation.PerformDNSCheck(domain)
 	response.Checks = append(response.Checks, dnsCheck)
 	if !dnsCheck.Passed {
 		metrics.ValidationRequests.WithLabelValues("dns_failed", "dns", clientID).Inc()
@@ -237,7 +217,7 @@ func validateEmail(email string, config config.Config, clientID string) Validati
 	}
 
 	// TLD check
-	tldCheck := performTLDCheck(domain)
+	tldCheck := validation.PerformTLDCheck(domain)
 	response.Checks = append(response.Checks, tldCheck)
 	if !tldCheck.Passed {
 		metrics.ValidationRequests.WithLabelValues("tld_failed", "tld", clientID).Inc()
@@ -246,12 +226,12 @@ func validateEmail(email string, config config.Config, clientID string) Validati
 	}
 
 	// Role account check
-	roleCheck := performRoleAccountCheck(email)
+	roleCheck := validation.PerformRoleAccountCheck(email)
 	response.Checks = append(response.Checks, roleCheck)
 	response.IsRoleAccount = !roleCheck.Passed
 
 	// Free provider check
-	freeCheck := performFreeProviderCheck(domain)
+	freeCheck := validation.PerformFreeProviderCheck(domain)
 	response.Checks = append(response.Checks, freeCheck)
 	response.IsFreeProvider = !freeCheck.Passed
 
@@ -262,101 +242,6 @@ func validateEmail(email string, config config.Config, clientID string) Validati
 	metrics.ValidationDuration.WithLabelValues("complete").Observe(response.ValidationTime)
 
 	return response
-}
-
-func performDNSCheck(domain string) Check {
-	check := Check{
-		Name:   "dns",
-		Passed: false,
-	}
-
-	// Check A records
-	_, err := net.LookupIP(domain)
-	if err != nil {
-		check.Details = "No A/AAAA records found"
-		return check
-	}
-
-	check.Passed = true
-	return check
-}
-
-func performTLDCheck(domain string) Check {
-	check := Check{
-		Name:   "tld",
-		Passed: false,
-	}
-
-	// Get TLD
-	parts := strings.Split(domain, ".")
-	if len(parts) < 2 {
-		check.Details = "Invalid domain format"
-		return check
-	}
-	tld := parts[len(parts)-1]
-
-	// List of valid TLDs
-	validTLDs := map[string]bool{
-		"com": true, "org": true, "net": true, "edu": true, "gov": true,
-		// Add more TLDs as needed
-	}
-
-	if !validTLDs[tld] {
-		check.Details = "Unsupported top-level domain"
-		return check
-	}
-
-	check.Passed = true
-	return check
-}
-
-func performRoleAccountCheck(email string) Check {
-	check := Check{
-		Name:   "role_account",
-		Passed: true,
-	}
-
-	// Common role-based prefixes
-	rolePrefixes := []string{
-		"admin", "contact", "info", "support", "sales",
-		"webmaster", "postmaster", "hostmaster", "abuse",
-	}
-
-	localPart := strings.Split(email, "@")[0]
-	for _, prefix := range rolePrefixes {
-		if strings.HasPrefix(strings.ToLower(localPart), prefix) {
-			check.Passed = false
-			check.Details = "Role-based account detected"
-			break
-		}
-	}
-
-	return check
-}
-
-func performFreeProviderCheck(domain string) Check {
-	check := Check{
-		Name:   "free_provider",
-		Passed: true,
-	}
-
-	// List of free email providers
-	freeProviders := map[string]bool{
-		"gmail.com":      true,
-		"yahoo.com":      true,
-		"hotmail.com":    true,
-		"outlook.com":    true,
-		"aol.com":        true,
-		"protonmail.com": true,
-		// Add more providers as needed
-	}
-
-	if freeProviders[domain] {
-		check.Passed = false
-		check.Details = "Free email provider detected"
-	}
-
-	return check
 }
 
 func authenticateRequest(r *http.Request, config config.Config) (string, error) {
@@ -430,131 +315,6 @@ func emailHandler(w http.ResponseWriter, r *http.Request, config config.Config) 
 	json.NewEncoder(w).Encode(result)
 }
 
-func performFormatCheck(email string) Check {
-	check := Check{
-		Name:   "format",
-		Passed: false,
-	}
-
-	emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
-	if !emailRegex.MatchString(email) {
-		check.Details = "Invalid email format"
-		return check
-	}
-
-	check.Passed = true
-	return check
-}
-
-func performLengthCheck(local, domain string) Check {
-	check := Check{
-		Name:   "length",
-		Passed: false,
-	}
-
-	if len(local) > 64 {
-		check.Details = "Local part exceeds 64 characters"
-		return check
-	}
-
-	if len(domain) > 255 {
-		check.Details = "Domain exceeds 255 characters"
-		return check
-	}
-
-	check.Passed = true
-	return check
-}
-
-func performMXCheck(domain string) Check {
-	check := Check{
-		Name:   "mx",
-		Passed: false,
-	}
-
-	mxRecords, err := net.LookupMX(domain)
-	if err != nil {
-		check.Details = "Could not find valid MX records"
-		return check
-	}
-
-	if len(mxRecords) == 0 {
-		check.Details = "No MX records found"
-		return check
-	}
-
-	check.Passed = true
-	return check
-}
-
-func performSMTPCheck(email, domain string, timeout time.Duration) Check {
-	check := Check{
-		Name:   "smtp",
-		Passed: false,
-	}
-
-	mxRecords, _ := net.LookupMX(domain)
-	if len(mxRecords) == 0 {
-		logger.WithField("domain", domain).Debug("No MX records available")
-		check.Details = "No MX records available"
-		return check
-	}
-
-	logger.WithFields(logrus.Fields{
-		"domain":  domain,
-		"mx_host": mxRecords[0].Host,
-		"email":   email,
-	}).Debug("Starting SMTP check")
-
-	client, err := dialSMTP(mxRecords[0].Host+":25", timeout)
-	if err != nil {
-		logger.WithFields(logrus.Fields{
-			"error": err,
-			"host":  mxRecords[0].Host,
-		}).Debug("Could not connect to mail server")
-		check.Details = "Could not connect to mail server"
-		return check
-	}
-	defer client.Close()
-
-	// HELO
-	if err := client.Hello("localhost"); err != nil {
-		logger.WithFields(logrus.Fields{
-			"error":   err,
-			"command": "HELO localhost",
-		}).Debug("SMTP HELO failed")
-		check.Details = "SMTP HELO failed"
-		return check
-	}
-	logger.WithField("command", "HELO localhost").Debug("SMTP command successful")
-
-	// MAIL FROM
-	if err := client.Mail("validate@localhost"); err != nil {
-		logger.WithFields(logrus.Fields{
-			"error":   err,
-			"command": "MAIL FROM:<validate@localhost>",
-		}).Debug("SMTP MAIL FROM failed")
-		check.Details = "SMTP MAIL FROM failed"
-		return check
-	}
-	logger.WithField("command", "MAIL FROM:<validate@localhost>").Debug("SMTP command successful")
-
-	// RCPT TO
-	if err := client.Rcpt(email); err != nil {
-		logger.WithFields(logrus.Fields{
-			"error":   err,
-			"command": "RCPT TO:<" + email + ">",
-		}).Debug("SMTP RCPT TO failed")
-		check.Details = "Email address rejected"
-		return check
-	}
-	logger.WithField("command", "RCPT TO:<"+email+">").Debug("SMTP command successful")
-
-	logger.WithField("email", email).Debug("SMTP validation successful")
-	check.Passed = true
-	return check
-}
-
 func loadDisposableDomains() (map[string]bool, error) {
 	domains := make(map[string]bool)
 
@@ -579,28 +339,7 @@ func loadDisposableDomains() (map[string]bool, error) {
 	return domains, nil
 }
 
-func checkDisposableEmail(domain string) Check {
-	check := Check{
-		Name:   "disposable",
-		Passed: true,
-	}
-
-	disposableDomains, err := loadDisposableDomains()
-	if err != nil {
-		logger.WithError(err).Error("Failed to load disposable domains")
-		check.Details = "Temporary validation error"
-		return check
-	}
-
-	if disposableDomains[domain] {
-		check.Passed = false
-		check.Details = "Disposable email domain detected"
-	}
-
-	return check
-}
-
-func dialSMTP(addr string, timeout time.Duration) (*smtp.Client, error) {
+func dialSMTP(addr string, timeout time.Duration, logger *logrus.Logger) (*smtp.Client, error) {
 	logger.WithFields(logrus.Fields{
 		"address": addr,
 		"timeout": timeout,
@@ -645,7 +384,7 @@ func batchEmailHandler(w http.ResponseWriter, r *http.Request, config config.Con
 		return
 	}
 
-	results := make([]ValidationResponse, 0, len(req.Emails))
+	results := make([]validation.ValidationResponse, 0, len(req.Emails))
 	for _, email := range req.Emails {
 		result := validateEmail(email, config, clientID)
 		results = append(results, result)
@@ -673,26 +412,26 @@ func domainReputationHandler(w http.ResponseWriter, r *http.Request, config conf
 
 	// Check if disposable domain
 	if config.DisposableCheck {
-		disposableCheck := checkDisposableEmail(domain)
+		disposableCheck := validation.CheckDisposableEmail(domain, logger)
 		if !disposableCheck.Passed {
 			score -= 50
 		}
 	}
 
 	// Check MX records
-	mxCheck := performMXCheck(domain)
+	mxCheck := validation.PerformMXCheck(domain)
 	if !mxCheck.Passed {
 		score -= 20
 	}
 
 	// Check DNS records
-	dnsCheck := performDNSCheck(domain)
+	dnsCheck := validation.PerformDNSCheck(domain)
 	if !dnsCheck.Passed {
 		score -= 10
 	}
 
 	// Check TLD
-	tldCheck := performTLDCheck(domain)
+	tldCheck := validation.PerformTLDCheck(domain)
 	if !tldCheck.Passed {
 		score -= 10
 	}
@@ -701,7 +440,7 @@ func domainReputationHandler(w http.ResponseWriter, r *http.Request, config conf
 		"domain":  domain,
 		"score":   score,
 		"rating":  getReputationRating(score),
-		"checks":  []Check{mxCheck, dnsCheck, tldCheck},
+		"checks":  []validation.Check{mxCheck, dnsCheck, tldCheck},
 		"version": VERSION,
 	}
 
