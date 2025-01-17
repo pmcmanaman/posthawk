@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -15,8 +16,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/rs/cors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
@@ -36,7 +39,7 @@ var (
 			Name: "posthawk_validation_requests_total",
 			Help: "Total number of email validation requests",
 		},
-		[]string{"status", "validation_type", "client_id"},
+		[]string{"status", "validation_type", "client_id", "domain"},
 	)
 
 	validationDuration = prometheus.NewHistogramVec(
@@ -45,7 +48,7 @@ var (
 			Help:    "Time spent validating emails",
 			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
 		},
-		[]string{"validation_type"},
+		[]string{"validation_type", "domain"},
 	)
 
 	activeRequests = prometheus.NewGauge(
@@ -60,7 +63,40 @@ var (
 			Name: "posthawk_rate_limit_exceeded_total",
 			Help: "Number of times rate limit was exceeded",
 		},
-		[]string{"client_id"},
+		[]string{"client_id", "domain"},
+	)
+
+	validationErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "posthawk_validation_errors_total",
+			Help: "Total number of validation errors",
+		},
+		[]string{"type", "client_id", "domain"},
+	)
+
+	requestLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "posthawk_request_latency_seconds",
+			Help:    "Request latency in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "endpoint", "status"},
+	)
+
+	requestSize = prometheus.NewSummaryVec(
+		prometheus.SummaryOpts{
+			Name: "posthawk_request_size_bytes",
+			Help: "Request size in bytes",
+		},
+		[]string{"method", "endpoint"},
+	)
+
+	responseSize = prometheus.NewSummaryVec(
+		prometheus.SummaryOpts{
+			Name: "posthawk_response_size_bytes",
+			Help: "Response size in bytes",
+		},
+		[]string{"method", "endpoint", "status"},
 	)
 
 	// Client-specific rate limiters
@@ -93,6 +129,8 @@ type ValidationResponse struct {
 	IsValid           bool    `json:"is_valid"`
 	Details           string  `json:"details"`
 	IsDisposable      bool    `json:"is_disposable,omitempty"`
+	IsRoleAccount     bool    `json:"is_role_account,omitempty"`
+	IsFreeProvider    bool    `json:"is_free_provider,omitempty"`
 	ValidationTime    float64 `json:"validation_time"`
 	Checks            []Check `json:"checks"`
 	RecommendedAction string  `json:"recommended_action,omitempty"`
@@ -107,7 +145,17 @@ type Check struct {
 }
 
 func init() {
-	prometheus.MustRegister(validationRequests, validationDuration, activeRequests, rateLimitExceeded)
+	prometheus.MustRegister(
+		validationRequests,
+		validationDuration,
+		activeRequests,
+		rateLimitExceeded,
+		validationErrors,
+		requestLatency,
+		requestSize,
+		responseSize,
+	)
+
 	logger.SetFormatter(&logrus.JSONFormatter{
 		FieldMap: logrus.FieldMap{
 			logrus.FieldKeyTime:  "timestamp",
@@ -115,6 +163,81 @@ func init() {
 			logrus.FieldKeyMsg:   "message",
 		},
 	})
+}
+
+// tracingMiddleware adds tracing headers and request context
+func tracingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		requestID := r.Header.Get("X-Request-ID")
+		if requestID == "" {
+			requestID = uuid.New().String()
+		}
+
+		// Add tracing context
+		ctx := context.WithValue(r.Context(), "requestID", requestID)
+		ctx = context.WithValue(ctx, "startTime", start)
+		r = r.WithContext(ctx)
+
+		// Log request start
+		logger.WithFields(logrus.Fields{
+			"request_id":   requestID,
+			"method":       r.Method,
+			"uri":          r.RequestURI,
+			"remote_addr":  r.RemoteAddr,
+			"user_agent":   r.UserAgent(),
+			"content_type": r.Header.Get("Content-Type"),
+		}).Info("Request started")
+
+		// Record request size
+		if r.ContentLength > 0 {
+			requestSize.WithLabelValues(r.Method, r.URL.Path).Observe(float64(r.ContentLength))
+		}
+
+		// Wrap response writer to capture status and size
+		ww := newWrappedWriter(w)
+		next.ServeHTTP(ww, r)
+
+		// Record metrics
+		duration := time.Since(start).Seconds()
+		requestLatency.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(ww.status)).Observe(duration)
+		responseSize.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(ww.status)).Observe(float64(ww.size))
+
+		// Log request completion
+		logger.WithFields(logrus.Fields{
+			"request_id":    requestID,
+			"method":        r.Method,
+			"uri":           r.RequestURI,
+			"status":        ww.status,
+			"duration_secs": duration,
+			"bytes":         ww.size,
+		}).Info("Request completed")
+	})
+}
+
+// wrappedWriter captures response status and size
+type wrappedWriter struct {
+	http.ResponseWriter
+	status int
+	size   int
+}
+
+func newWrappedWriter(w http.ResponseWriter) *wrappedWriter {
+	return &wrappedWriter{ResponseWriter: w}
+}
+
+func (w *wrappedWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *wrappedWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	size, err := w.ResponseWriter.Write(b)
+	w.size += size
+	return size, err
 }
 
 func loadConfig() Config {
@@ -167,11 +290,13 @@ func validateEmail(email string, config Config, clientID string) ValidationRespo
 	defer activeRequests.Dec()
 
 	response := ValidationResponse{
-		Email:       email,
-		IsValid:     false,
-		Checks:      make([]Check, 0),
-		Version:     VERSION,
-		ServiceName: APP_NAME,
+		Email:          email,
+		IsValid:        false,
+		Checks:         make([]Check, 0),
+		Version:        VERSION,
+		ServiceName:    APP_NAME,
+		IsRoleAccount:  false,
+		IsFreeProvider: false,
 	}
 
 	// Format check
@@ -226,6 +351,34 @@ func validateEmail(email string, config Config, clientID string) ValidationRespo
 		return response
 	}
 
+	// DNS record check
+	dnsCheck := performDNSCheck(domain)
+	response.Checks = append(response.Checks, dnsCheck)
+	if !dnsCheck.Passed {
+		validationRequests.WithLabelValues("dns_failed", "dns", clientID).Inc()
+		response.Details = dnsCheck.Details
+		return response
+	}
+
+	// TLD check
+	tldCheck := performTLDCheck(domain)
+	response.Checks = append(response.Checks, tldCheck)
+	if !tldCheck.Passed {
+		validationRequests.WithLabelValues("tld_failed", "tld", clientID).Inc()
+		response.Details = tldCheck.Details
+		return response
+	}
+
+	// Role account check
+	roleCheck := performRoleAccountCheck(email)
+	response.Checks = append(response.Checks, roleCheck)
+	response.IsRoleAccount = !roleCheck.Passed
+
+	// Free provider check
+	freeCheck := performFreeProviderCheck(domain)
+	response.Checks = append(response.Checks, freeCheck)
+	response.IsFreeProvider = !freeCheck.Passed
+
 	response.IsValid = true
 	response.Details = "Email address is valid"
 	response.ValidationTime = time.Since(startTime).Seconds()
@@ -233,6 +386,101 @@ func validateEmail(email string, config Config, clientID string) ValidationRespo
 	validationDuration.WithLabelValues("complete").Observe(response.ValidationTime)
 
 	return response
+}
+
+func performDNSCheck(domain string) Check {
+	check := Check{
+		Name:   "dns",
+		Passed: false,
+	}
+
+	// Check A records
+	_, err := net.LookupIP(domain)
+	if err != nil {
+		check.Details = "No A/AAAA records found"
+		return check
+	}
+
+	check.Passed = true
+	return check
+}
+
+func performTLDCheck(domain string) Check {
+	check := Check{
+		Name:   "tld",
+		Passed: false,
+	}
+
+	// Get TLD
+	parts := strings.Split(domain, ".")
+	if len(parts) < 2 {
+		check.Details = "Invalid domain format"
+		return check
+	}
+	tld := parts[len(parts)-1]
+
+	// List of valid TLDs
+	validTLDs := map[string]bool{
+		"com": true, "org": true, "net": true, "edu": true, "gov": true,
+		// Add more TLDs as needed
+	}
+
+	if !validTLDs[tld] {
+		check.Details = "Unsupported top-level domain"
+		return check
+	}
+
+	check.Passed = true
+	return check
+}
+
+func performRoleAccountCheck(email string) Check {
+	check := Check{
+		Name:   "role_account",
+		Passed: true,
+	}
+
+	// Common role-based prefixes
+	rolePrefixes := []string{
+		"admin", "contact", "info", "support", "sales",
+		"webmaster", "postmaster", "hostmaster", "abuse",
+	}
+
+	localPart := strings.Split(email, "@")[0]
+	for _, prefix := range rolePrefixes {
+		if strings.HasPrefix(strings.ToLower(localPart), prefix) {
+			check.Passed = false
+			check.Details = "Role-based account detected"
+			break
+		}
+	}
+
+	return check
+}
+
+func performFreeProviderCheck(domain string) Check {
+	check := Check{
+		Name:   "free_provider",
+		Passed: true,
+	}
+
+	// List of free email providers
+	freeProviders := map[string]bool{
+		"gmail.com":      true,
+		"yahoo.com":      true,
+		"hotmail.com":    true,
+		"outlook.com":    true,
+		"aol.com":        true,
+		"protonmail.com": true,
+		// Add more providers as needed
+	}
+
+	if freeProviders[domain] {
+		check.Passed = false
+		check.Details = "Free email provider detected"
+	}
+
+	return check
 }
 
 func authenticateRequest(r *http.Request, config Config) (string, error) {
@@ -526,6 +774,146 @@ func getEnvBool(key string, fallback bool) bool {
 	return fallback
 }
 
+// batchEmailHandler handles batch email validation requests
+func batchEmailHandler(w http.ResponseWriter, r *http.Request, config Config) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	clientID, err := authenticateRequest(r, config)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		Emails []string `json:"emails"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Emails) > 100 {
+		http.Error(w, "Maximum batch size is 100 emails", http.StatusBadRequest)
+		return
+	}
+
+	results := make([]ValidationResponse, 0, len(req.Emails))
+	for _, email := range req.Emails {
+		result := validateEmail(email, config, clientID)
+		results = append(results, result)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
+}
+
+// domainReputationHandler provides domain reputation information
+func domainReputationHandler(w http.ResponseWriter, r *http.Request, config Config) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	domain := r.URL.Query().Get("domain")
+	if domain == "" {
+		http.Error(w, "Domain parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	// Basic reputation scoring based on various factors
+	score := 100.0
+
+	// Check if disposable domain
+	if config.DisposableCheck {
+		disposableCheck := checkDisposableEmail(domain)
+		if !disposableCheck.Passed {
+			score -= 50
+		}
+	}
+
+	// Check MX records
+	mxCheck := performMXCheck(domain)
+	if !mxCheck.Passed {
+		score -= 20
+	}
+
+	// Check DNS records
+	dnsCheck := performDNSCheck(domain)
+	if !dnsCheck.Passed {
+		score -= 10
+	}
+
+	// Check TLD
+	tldCheck := performTLDCheck(domain)
+	if !tldCheck.Passed {
+		score -= 10
+	}
+
+	response := map[string]interface{}{
+		"domain":  domain,
+		"score":   score,
+		"rating":  getReputationRating(score),
+		"checks":  []Check{mxCheck, dnsCheck, tldCheck},
+		"version": VERSION,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func getReputationRating(score float64) string {
+	switch {
+	case score >= 90:
+		return "excellent"
+	case score >= 70:
+		return "good"
+	case score >= 50:
+		return "fair"
+	case score >= 30:
+		return "poor"
+	default:
+		return "bad"
+	}
+}
+
+// statsHandler returns service statistics
+func statsHandler(w http.ResponseWriter, r *http.Request, config Config) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	stats := map[string]interface{}{
+		"total_requests":      getCounterValue(validationRequests),
+		"active_requests":     getGaugeValue(activeRequests),
+		"rate_limit_exceeded": getCounterValue(rateLimitExceeded),
+		"validation_errors":   getCounterValue(validationErrors),
+		"version":             VERSION,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
+}
+
+func getCounterValue(counter *prometheus.CounterVec) float64 {
+	metric := &dto.Metric{}
+	if err := counter.With(prometheus.Labels{}).Write(metric); err == nil {
+		return metric.Counter.GetValue()
+	}
+	return 0
+}
+
+func getGaugeValue(gauge prometheus.Gauge) float64 {
+	metric := &dto.Metric{}
+	if err := gauge.Write(metric); err == nil {
+		return metric.Gauge.GetValue()
+	}
+	return 0
+}
+
 func main() {
 	config := loadConfig()
 
@@ -537,10 +925,32 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	// Add middleware
+	handler := tracingMiddleware(mux)
+
+	// Versioned API endpoints
+	v1 := http.NewServeMux()
+
 	// Main validation endpoint
-	mux.HandleFunc("/validate", func(w http.ResponseWriter, r *http.Request) {
+	v1.HandleFunc("/validate", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-API-Version", "v1")
 		emailHandler(w, r, config)
 	})
+
+	// Batch validation endpoint
+	v1.HandleFunc("/validate/batch", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-API-Version", "v1")
+		batchEmailHandler(w, r, config)
+	})
+
+	// Domain reputation endpoint
+	v1.HandleFunc("/domain/reputation", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-API-Version", "v1")
+		domainReputationHandler(w, r, config)
+	})
+
+	// Mount versioned API
+	mux.Handle("/v1/", http.StripPrefix("/v1", v1))
 
 	// Prometheus metrics endpoint
 	mux.Handle("/metrics", promhttp.Handler())
@@ -561,14 +971,19 @@ func main() {
 		})
 	})
 
+	// Statistics endpoint
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+		statsHandler(w, r, config)
+	})
+
 	// Add CORS middleware
-	handler := cors.New(cors.Options{
+	handler = cors.New(cors.Options{
 		AllowedOrigins:   config.AllowedOrigins,
 		AllowedMethods:   []string{"POST", "GET", "OPTIONS"},
-		AllowedHeaders:   []string{"Content-Type", "X-API-Key"},
+		AllowedHeaders:   []string{"Content-Type", "X-API-Key", "X-Request-ID"},
 		AllowCredentials: true,
 		MaxAge:           300, // Maximum value not ignored by any major browser
-	}).Handler(mux)
+	}).Handler(handler)
 
 	// Start server
 	serverAddr := ":" + config.Port

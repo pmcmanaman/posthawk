@@ -3,20 +3,11 @@
 ## Overview
 PostHawk is a precision email validation service that provides comprehensive email verification through multiple validation checks. It's designed as a high-performance, containerized Go application with built-in metrics and rate limiting.
 
-Key Features:
-- Format validation
-- Length validation
-- MX record verification
-- SMTP server verification
-- Disposable email detection
-- Rate limiting per API key
-- Prometheus metrics integration
-- CORS support
-- JSON API responses
+## API Documentation (v1)
 
-## API Endpoints
+### Endpoints
 
-### POST /validate
+#### POST /v1/validate
 Validates an email address
 
 **Request:**
@@ -57,14 +48,97 @@ Validates an email address
 }
 ```
 
-### GET /metrics
-Prometheus metrics endpoint
+#### POST /v1/validate/batch
+Validates up to 100 email addresses in a single request
 
-### GET /version
+**Request:**
+```json
+{
+  "emails": ["user1@example.com", "user2@example.com"]
+}
+```
+
+**Response:**
+```json
+[
+  {
+    "email": "user1@example.com",
+    "is_valid": true,
+    "details": "Email address is valid",
+    ...
+  },
+  {
+    "email": "user2@example.com",
+    "is_valid": false,
+    "details": "Invalid email format",
+    ...
+  }
+]
+```
+
+#### GET /v1/domain/reputation
+Provides domain reputation information
+
+**Request:**
+```
+GET /v1/domain/reputation?domain=example.com
+```
+
+**Response:**
+```json
+{
+  "domain": "example.com",
+  "score": 85.0,
+  "rating": "good",
+  "checks": [
+    {
+      "name": "mx",
+      "passed": true
+    },
+    {
+      "name": "dns",
+      "passed": true
+    }
+  ],
+  "version": "1.0.0"
+}
+```
+
+#### GET /v1/stats
+Returns service statistics
+
+**Response:**
+```json
+{
+  "total_requests": 1234,
+  "active_requests": 5,
+  "rate_limit_exceeded": 12,
+  "validation_errors": 34,
+  "version": "1.0.0"
+}
+```
+
+#### GET /v1/health
+Health check endpoint
+
+**Response:**
+```json
+{
+  "status": "healthy",
+  "version": "1.0.0"
+}
+```
+
+#### GET /v1/version
 Returns service version information
 
-### GET /health
-Health check endpoint
+**Response:**
+```json
+{
+  "version": "1.0.0",
+  "name": "PostHawk"
+}
+```
 
 ## Configuration
 
