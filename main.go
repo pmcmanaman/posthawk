@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -430,28 +431,41 @@ func performSMTPCheck(email, domain string, timeout time.Duration) Check {
 	return check
 }
 
+func loadDisposableDomains() (map[string]bool, error) {
+	domains := make(map[string]bool)
+
+	file, err := os.Open("disposable_domains.txt")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open disposable domains file: %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		domain := strings.TrimSpace(scanner.Text())
+		if domain != "" {
+			domains[domain] = true
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading disposable domains file: %w", err)
+	}
+
+	return domains, nil
+}
+
 func checkDisposableEmail(domain string) Check {
 	check := Check{
 		Name:   "disposable",
 		Passed: true,
 	}
 
-	disposableDomains := map[string]bool{
-		"tempmail.com":        true,
-		"throwaway.com":       true,
-		"10minutemail.com":    true,
-		"guerrillamail.com":   true,
-		"mailinator.com":      true,
-		"temporary-mail.net":  true,
-		"sharklasers.com":     true,
-		"yopmail.com":         true,
-		"tempmail.net":        true,
-		"temp-mail.org":       true,
-		"fakeinbox.com":       true,
-		"tempinbox.com":       true,
-		"tempmailaddress.com": true,
-		"mytemp.email":        true,
-		"burnermail.io":       true,
+	disposableDomains, err := loadDisposableDomains()
+	if err != nil {
+		logger.WithError(err).Error("Failed to load disposable domains")
+		check.Details = "Temporary validation error"
+		return check
 	}
 
 	if disposableDomains[domain] {
