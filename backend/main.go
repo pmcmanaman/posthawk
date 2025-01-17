@@ -512,6 +512,10 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	// Serve static files from the root directory
+	fs := http.FileServer(http.Dir("../"))
+	mux.Handle("/", fs)
+
 	// Add middleware
 	handler := tracingMiddleware(mux)
 
@@ -522,6 +526,32 @@ func main() {
 	v1.HandleFunc("/v1/validate", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-API-Version", "v1")
 		emailHandler(w, r, cfg)
+	})
+
+	// Simple validation endpoint for frontend
+	v1.HandleFunc("/v1/check-email", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			Email string `json:"email"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		// Use existing validation logic
+		result := validateEmail(req.Email, cfg, "frontend")
+
+		// Return simplified response
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"valid":   result.IsValid,
+			"message": result.Details,
+		})
 	})
 
 	// Batch validation endpoint
