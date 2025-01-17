@@ -1,7 +1,7 @@
 .PHONY: build-backend build-frontend run test clean
 
 build-backend:
-	docker build -t posthawk-backend .
+	docker build -t posthawk-backend -f backend/Dockerfile .
 
 build-frontend:
 	cd frontend && docker build -t posthawk-frontend .
