@@ -23,96 +23,25 @@ import (
 	"github.com/rs/cors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
+
+	"posthawk/backend/config"
+	"posthawk/backend/metrics"
 )
 
 const (
-	VERSION  = "1.0.0"
-	APP_NAME = "PostHawk"
+	VERSION  = config.VERSION
+	APP_NAME = config.APP_NAME
 )
 
 var (
 	logger = logrus.New()
-
-	// Prometheus metrics
-	validationRequests = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "posthawk_validation_requests_total",
-			Help: "Total number of email validation requests",
-		},
-		[]string{"status", "validation_type", "client_id", "domain"},
-	)
-
-	validationDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "posthawk_validation_duration_seconds",
-			Help:    "Time spent validating emails",
-			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
-		},
-		[]string{"validation_type", "domain"},
-	)
-
-	activeRequests = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "posthawk_active_requests",
-			Help: "Number of active validation requests",
-		},
-	)
-
-	rateLimitExceeded = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "posthawk_rate_limit_exceeded_total",
-			Help: "Number of times rate limit was exceeded",
-		},
-		[]string{"client_id", "domain"},
-	)
-
-	validationErrors = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "posthawk_validation_errors_total",
-			Help: "Total number of validation errors",
-		},
-		[]string{"type", "client_id", "domain"},
-	)
-
-	requestLatency = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "posthawk_request_latency_seconds",
-			Help:    "Request latency in seconds",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"method", "endpoint", "status"},
-	)
-
-	requestSize = prometheus.NewSummaryVec(
-		prometheus.SummaryOpts{
-			Name: "posthawk_request_size_bytes",
-			Help: "Request size in bytes",
-		},
-		[]string{"method", "endpoint"},
-	)
-
-	responseSize = prometheus.NewSummaryVec(
-		prometheus.SummaryOpts{
-			Name: "posthawk_response_size_bytes",
-			Help: "Response size in bytes",
-		},
-		[]string{"method", "endpoint", "status"},
-	)
+	cfg    = config.LoadConfig(logger)
 
 	// Client-specific rate limiters
 	clientLimiters = make(map[string]*rate.Limiter)
 )
 
-type Config struct {
-	Port            string
-	RateLimit       float64
-	RateBurst       int
-	SMTPTimeout     time.Duration
-	AllowedOrigins  []string
-	LogLevel        string
-	DisposableCheck bool
-	APIKeys         map[string]ClientConfig
-}
+// Remove local Config type definition since we're using config.Config
 
 type ClientConfig struct {
 	RateLimit float64
@@ -145,16 +74,7 @@ type Check struct {
 }
 
 func init() {
-	prometheus.MustRegister(
-		validationRequests,
-		validationDuration,
-		activeRequests,
-		rateLimitExceeded,
-		validationErrors,
-		requestLatency,
-		requestSize,
-		responseSize,
-	)
+	metrics.RegisterMetrics()
 
 	logger.SetFormatter(&logrus.JSONFormatter{
 		FieldMap: logrus.FieldMap{
@@ -191,7 +111,7 @@ func tracingMiddleware(next http.Handler) http.Handler {
 
 		// Record request size
 		if r.ContentLength > 0 {
-			requestSize.WithLabelValues(r.Method, r.URL.Path).Observe(float64(r.ContentLength))
+			metrics.RequestSize.WithLabelValues(r.Method, r.URL.Path).Observe(float64(r.ContentLength))
 		}
 
 		// Wrap response writer to capture status and size
@@ -200,8 +120,8 @@ func tracingMiddleware(next http.Handler) http.Handler {
 
 		// Record metrics
 		duration := time.Since(start).Seconds()
-		requestLatency.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(ww.status)).Observe(duration)
-		responseSize.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(ww.status)).Observe(float64(ww.size))
+		metrics.RequestLatency.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(ww.status)).Observe(duration)
+		metrics.ResponseSize.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(ww.status)).Observe(float64(ww.size))
 
 		// Log request completion
 		logger.WithFields(logrus.Fields{
@@ -240,54 +160,10 @@ func (w *wrappedWriter) Write(b []byte) (int, error) {
 	return size, err
 }
 
-func loadConfig() Config {
-	apiKeys := make(map[string]ClientConfig)
-	if keysStr := getEnv("API_KEYS", ""); keysStr != "" {
-		logger.WithField("api_keys_str", keysStr).Debug("Loading API keys")
-		for _, pair := range strings.Split(keysStr, ",") {
-			parts := strings.Split(pair, ":")
-			if len(parts) == 4 {
-				rateLimit, _ := strconv.ParseFloat(parts[1], 64)
-				burst, _ := strconv.Atoi(parts[2])
-				apiKeys[parts[0]] = ClientConfig{
-					RateLimit: rateLimit,
-					RateBurst: burst,
-					Name:      parts[3],
-				}
-				logger.WithFields(logrus.Fields{
-					"key":        parts[0],
-					"rate_limit": rateLimit,
-					"burst":      burst,
-					"name":       parts[3],
-				}).Debug("Loaded API key config")
-			}
-		}
-	}
-
-	config := Config{
-		Port:            getEnv("PORT", "8080"),
-		RateLimit:       getEnvFloat("RATE_LIMIT", 5),
-		RateBurst:       getEnvInt("RATE_BURST", 10),
-		SMTPTimeout:     time.Duration(getEnvInt("SMTP_TIMEOUT", 10)) * time.Second,
-		AllowedOrigins:  strings.Split(getEnv("ALLOWED_ORIGINS", "*"), ","),
-		LogLevel:        getEnv("LOG_LEVEL", "debug"),
-		DisposableCheck: getEnvBool("CHECK_DISPOSABLE", true),
-		APIKeys:         apiKeys,
-	}
-
-	logger.WithFields(logrus.Fields{
-		"api_keys_count": len(apiKeys),
-		"rate_limit":     config.RateLimit,
-		"burst":          config.RateBurst,
-	}).Info("Configuration loaded")
-
-	return config
-}
-
-func validateEmail(email string, config Config, clientID string) ValidationResponse {
+func validateEmail(email string, config config.Config, clientID string) ValidationResponse {
 	startTime := time.Now()
-	activeRequests.Inc()
-	defer activeRequests.Dec()
+	metrics.ActiveRequests.Inc()
+	defer metrics.ActiveRequests.Dec()
 
 	response := ValidationResponse{
 		Email:          email,
@@ -303,7 +179,7 @@ func validateEmail(email string, config Config, clientID string) ValidationRespo
 	formatCheck := performFormatCheck(email)
 	response.Checks = append(response.Checks, formatCheck)
 	if !formatCheck.Passed {
-		validationRequests.WithLabelValues("invalid_format", "format", clientID).Inc()
+		metrics.ValidationRequests.WithLabelValues("invalid_format", "format", clientID).Inc()
 		response.Details = formatCheck.Details
 		return response
 	}
@@ -315,7 +191,7 @@ func validateEmail(email string, config Config, clientID string) ValidationRespo
 	lengthCheck := performLengthCheck(parts[0], domain)
 	response.Checks = append(response.Checks, lengthCheck)
 	if !lengthCheck.Passed {
-		validationRequests.WithLabelValues("invalid_length", "length", clientID).Inc()
+		metrics.ValidationRequests.WithLabelValues("invalid_length", "length", clientID).Inc()
 		response.Details = lengthCheck.Details
 		return response
 	}
@@ -326,7 +202,7 @@ func validateEmail(email string, config Config, clientID string) ValidationRespo
 		response.Checks = append(response.Checks, disposableCheck)
 		response.IsDisposable = !disposableCheck.Passed
 		if response.IsDisposable {
-			validationRequests.WithLabelValues("disposable", "disposable", clientID).Inc()
+			metrics.ValidationRequests.WithLabelValues("disposable", "disposable", clientID).Inc()
 			response.Details = "Disposable email address detected"
 			response.RecommendedAction = "Request a different email address"
 			return response
@@ -337,7 +213,7 @@ func validateEmail(email string, config Config, clientID string) ValidationRespo
 	mxCheck := performMXCheck(domain)
 	response.Checks = append(response.Checks, mxCheck)
 	if !mxCheck.Passed {
-		validationRequests.WithLabelValues("mx_failed", "mx", clientID).Inc()
+		metrics.ValidationRequests.WithLabelValues("mx_failed", "mx", clientID).Inc()
 		response.Details = mxCheck.Details
 		return response
 	}
@@ -346,7 +222,7 @@ func validateEmail(email string, config Config, clientID string) ValidationRespo
 	smtpCheck := performSMTPCheck(email, domain, config.SMTPTimeout)
 	response.Checks = append(response.Checks, smtpCheck)
 	if !smtpCheck.Passed {
-		validationRequests.WithLabelValues("smtp_failed", "smtp", clientID).Inc()
+		metrics.ValidationRequests.WithLabelValues("smtp_failed", "smtp", clientID).Inc()
 		response.Details = smtpCheck.Details
 		return response
 	}
@@ -355,7 +231,7 @@ func validateEmail(email string, config Config, clientID string) ValidationRespo
 	dnsCheck := performDNSCheck(domain)
 	response.Checks = append(response.Checks, dnsCheck)
 	if !dnsCheck.Passed {
-		validationRequests.WithLabelValues("dns_failed", "dns", clientID).Inc()
+		metrics.ValidationRequests.WithLabelValues("dns_failed", "dns", clientID).Inc()
 		response.Details = dnsCheck.Details
 		return response
 	}
@@ -364,7 +240,7 @@ func validateEmail(email string, config Config, clientID string) ValidationRespo
 	tldCheck := performTLDCheck(domain)
 	response.Checks = append(response.Checks, tldCheck)
 	if !tldCheck.Passed {
-		validationRequests.WithLabelValues("tld_failed", "tld", clientID).Inc()
+		metrics.ValidationRequests.WithLabelValues("tld_failed", "tld", clientID).Inc()
 		response.Details = tldCheck.Details
 		return response
 	}
@@ -382,8 +258,8 @@ func validateEmail(email string, config Config, clientID string) ValidationRespo
 	response.IsValid = true
 	response.Details = "Email address is valid"
 	response.ValidationTime = time.Since(startTime).Seconds()
-	validationRequests.WithLabelValues("success", "all", clientID).Inc()
-	validationDuration.WithLabelValues("complete").Observe(response.ValidationTime)
+	metrics.ValidationRequests.WithLabelValues("success", "all", clientID).Inc()
+	metrics.ValidationDuration.WithLabelValues("complete").Observe(response.ValidationTime)
 
 	return response
 }
@@ -483,7 +359,7 @@ func performFreeProviderCheck(domain string) Check {
 	return check
 }
 
-func authenticateRequest(r *http.Request, config Config) (string, error) {
+func authenticateRequest(r *http.Request, config config.Config) (string, error) {
 	apiKey := r.Header.Get("X-API-Key")
 	if apiKey == "" {
 		return "", fmt.Errorf("missing API key")
@@ -497,7 +373,7 @@ func authenticateRequest(r *http.Request, config Config) (string, error) {
 	return clientConfig.Name, nil
 }
 
-func emailHandler(w http.ResponseWriter, r *http.Request, config Config) {
+func emailHandler(w http.ResponseWriter, r *http.Request, config config.Config) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -524,7 +400,7 @@ func emailHandler(w http.ResponseWriter, r *http.Request, config Config) {
 	}
 
 	if !limiter.Allow() {
-		rateLimitExceeded.WithLabelValues(clientID).Inc()
+		metrics.RateLimitExceeded.WithLabelValues(clientID).Inc()
 		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 		logger.WithFields(logrus.Fields{
 			"client_id":     clientID,
@@ -743,39 +619,8 @@ func dialSMTP(addr string, timeout time.Duration) (*smtp.Client, error) {
 	return smtp.NewClient(conn, addr)
 }
 
-func getEnv(key, fallback string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	return fallback
-}
-
-func getEnvInt(key string, fallback int) int {
-	strValue := getEnv(key, "")
-	if value, err := strconv.Atoi(strValue); err == nil {
-		return value
-	}
-	return fallback
-}
-
-func getEnvFloat(key string, fallback float64) float64 {
-	strValue := getEnv(key, "")
-	if value, err := strconv.ParseFloat(strValue, 64); err == nil {
-		return value
-	}
-	return fallback
-}
-
-func getEnvBool(key string, fallback bool) bool {
-	strValue := getEnv(key, "")
-	if value, err := strconv.ParseBool(strValue); err == nil {
-		return value
-	}
-	return fallback
-}
-
 // batchEmailHandler handles batch email validation requests
-func batchEmailHandler(w http.ResponseWriter, r *http.Request, config Config) {
+func batchEmailHandler(w http.ResponseWriter, r *http.Request, config config.Config) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -811,7 +656,7 @@ func batchEmailHandler(w http.ResponseWriter, r *http.Request, config Config) {
 }
 
 // domainReputationHandler provides domain reputation information
-func domainReputationHandler(w http.ResponseWriter, r *http.Request, config Config) {
+func domainReputationHandler(w http.ResponseWriter, r *http.Request, config config.Config) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -880,17 +725,17 @@ func getReputationRating(score float64) string {
 }
 
 // statsHandler returns service statistics
-func statsHandler(w http.ResponseWriter, r *http.Request, config Config) {
+func statsHandler(w http.ResponseWriter, r *http.Request, config config.Config) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	stats := map[string]interface{}{
-		"total_requests":      getCounterValue(validationRequests),
-		"active_requests":     getGaugeValue(activeRequests),
-		"rate_limit_exceeded": getCounterValue(rateLimitExceeded),
-		"validation_errors":   getCounterValue(validationErrors),
+		"total_requests":      getCounterValue(metrics.ValidationRequests),
+		"active_requests":     getGaugeValue(metrics.ActiveRequests),
+		"rate_limit_exceeded": getCounterValue(metrics.RateLimitExceeded),
+		"validation_errors":   getCounterValue(metrics.ValidationErrors),
 		"version":             VERSION,
 	}
 
@@ -915,9 +760,7 @@ func getGaugeValue(gauge prometheus.Gauge) float64 {
 }
 
 func main() {
-	config := loadConfig()
-
-	level, err := logrus.ParseLevel(config.LogLevel)
+	level, err := logrus.ParseLevel(cfg.LogLevel)
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -934,19 +777,19 @@ func main() {
 	// Main validation endpoint
 	v1.HandleFunc("/validate", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-API-Version", "v1")
-		emailHandler(w, r, config)
+		emailHandler(w, r, cfg)
 	})
 
 	// Batch validation endpoint
 	v1.HandleFunc("/validate/batch", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-API-Version", "v1")
-		batchEmailHandler(w, r, config)
+		batchEmailHandler(w, r, cfg)
 	})
 
 	// Domain reputation endpoint
 	v1.HandleFunc("/domain/reputation", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-API-Version", "v1")
-		domainReputationHandler(w, r, config)
+		domainReputationHandler(w, r, cfg)
 	})
 
 	// Mount versioned API
@@ -973,12 +816,12 @@ func main() {
 
 	// Statistics endpoint
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
-		statsHandler(w, r, config)
+		statsHandler(w, r, cfg)
 	})
 
 	// Add CORS middleware
 	handler = cors.New(cors.Options{
-		AllowedOrigins:   config.AllowedOrigins,
+		AllowedOrigins:   cfg.AllowedOrigins,
 		AllowedMethods:   []string{"POST", "GET", "OPTIONS"},
 		AllowedHeaders:   []string{"Content-Type", "X-API-Key", "X-Request-ID"},
 		AllowCredentials: true,
@@ -986,9 +829,9 @@ func main() {
 	}).Handler(handler)
 
 	// Start server
-	serverAddr := ":" + config.Port
+	serverAddr := ":" + cfg.Port
 	logger.WithFields(logrus.Fields{
-		"port":    config.Port,
+		"port":    cfg.Port,
 		"version": VERSION,
 		"name":    APP_NAME,
 	}).Info("Starting server")
