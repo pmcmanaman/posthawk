@@ -24,6 +24,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"posthawk/backend/config"
+	"posthawk/backend/database"
 	"posthawk/backend/metrics"
 	"posthawk/backend/validation"
 )
@@ -140,7 +141,16 @@ func (w *wrappedWriter) Write(b []byte) (int, error) {
 	return size, err
 }
 
-func validateEmail(email string, config config.Config, clientID string) validation.ValidationResponse {
+func validateEmail(email string, config config.Config, clientID string, logger *logrus.Logger) validation.ValidationResponse {
+	// Check cache first
+	cachedResponse, err := database.GetCachedValidation(email, logger)
+	if err != nil {
+		logger.WithError(err).Warn("Failed to check cache")
+	} else if cachedResponse != nil {
+		// Return cached response if found
+		return *cachedResponse
+	}
+
 	startTime := time.Now()
 	metrics.ActiveRequests.Inc()
 	defer metrics.ActiveRequests.Dec()
@@ -246,6 +256,11 @@ func validateEmail(email string, config config.Config, clientID string) validati
 	metrics.ValidationRequests.WithLabelValues("success", "all", clientID, domain).Inc()
 	metrics.ValidationDuration.WithLabelValues("complete", domain).Observe(response.ValidationTime)
 
+	// Store result in cache
+	if err := database.StoreValidation(response); err != nil {
+		logger.WithError(err).Warn("Failed to store validation result in cache")
+	}
+
 	return response
 }
 
@@ -314,7 +329,7 @@ func emailHandler(w http.ResponseWriter, r *http.Request, config config.Config) 
 		"remote_addr": r.RemoteAddr,
 	}).Info("Validation request received")
 
-	result := validateEmail(req.Email, config, clientID)
+	result := validateEmail(req.Email, config, clientID, logger)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
@@ -391,7 +406,7 @@ func batchEmailHandler(w http.ResponseWriter, r *http.Request, config config.Con
 
 	results := make([]validation.ValidationResponse, 0, len(req.Emails))
 	for _, email := range req.Emails {
-		result := validateEmail(email, config, clientID)
+		result := validateEmail(email, config, clientID, logger)
 		results = append(results, result)
 	}
 
@@ -504,6 +519,17 @@ func getGaugeValue(gauge prometheus.Gauge) float64 {
 }
 
 func main() {
+	// Initialize database
+	err := database.InitDatabase()
+	if err != nil {
+		logger.WithError(err).Fatal("Failed to initialize database")
+	}
+	defer func() {
+		if err := database.CloseDatabase(); err != nil {
+			logger.WithError(err).Error("Failed to close database")
+		}
+	}()
+
 	level, err := logrus.ParseLevel(cfg.LogLevel)
 	if err != nil {
 		logger.Fatal(err)
@@ -544,7 +570,7 @@ func main() {
 		}
 
 		// Use existing validation logic
-		result := validateEmail(req.Email, cfg, "frontend")
+		result := validateEmail(req.Email, cfg, "frontend", logger)
 
 		// Return simplified response
 		w.Header().Set("Content-Type", "application/json")

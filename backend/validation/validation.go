@@ -230,6 +230,19 @@ func PerformSMTPCheck(email, domain string, timeout time.Duration, logger *logru
 	}
 	code, message, err = tc.ReadResponse(250)
 	if err != nil {
+		// Check for IP blocked error
+		if strings.Contains(message, "Blocked") {
+			logger.WithFields(logrus.Fields{
+				"email": email,
+				"error": message,
+				"cache": "miss",
+			}).Debug("SMTP validation blocked - IP blocked")
+			return Check{
+				Name:    "smtp",
+				Passed:  false,
+				Details: "SMTP validation uncheckable - IP blocked",
+			}
+		}
 		logger.WithFields(logrus.Fields{
 			"error": err.Error(),
 			"log":   smtpLog.String(),
